@@ -98,7 +98,7 @@ test("search results received after 845 ms reach Gemini and both calls are logge
   assert.equal(serper.event, "serper.request");
   assert.equal(serper.timeoutMs, 1300);
   assert.equal(gemini.event, "gemini.request");
-  assert.equal(gemini.timeoutMs, 2155);
+  assert.equal(gemini.timeoutMs, 2455);
   assert.equal(gemini.status, 200);
   assert.equal(alice.event, "alice.response");
   assert.equal(alice.outcome, "answered");
