@@ -61,3 +61,46 @@ test("launch request returns a valid Alice greeting without external API keys", 
   assert.match(payload.response.text, /Привет/);
   assert.equal(payload.response.end_session, false);
 });
+
+test("search results received after 845 ms reach Gemini and both calls are logged", async t => {
+  const handler = (await import("../api/index.js")).default;
+  for (const key of ["SERPER_API_KEY", "GEMINI_API_KEY", "GEMINI_MODEL"]) {
+    const originalValue = process.env[key];
+    process.env[key] = "test";
+    t.after(() => {
+      if (originalValue === undefined) delete process.env[key];
+      else process.env[key] = originalValue;
+    });
+  }
+
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const info = t.mock.method(console, "info", () => {});
+  const fetch = t.mock.method(globalThis, "fetch", async (url, { signal }) => {
+    if (url === "https://google.serper.dev/search") {
+      t.mock.timers.tick(845);
+      signal.throwIfAborted();
+      return Response.json({ answerBox: { answer: "В Москве 5 градусов." } });
+    }
+    return Response.json({ candidates: [{ content: { parts: [{ text: "Сейчас 5 градусов." }] } }] });
+  });
+
+  const reply = await handler({ method: "POST", body: { request: { command: "Какая погода в Москве?" } } }, {
+    status(code) { assert.equal(code, 200); return this; },
+    json(value) { return value; }
+  });
+
+  assert.equal(fetch.mock.callCount(), 2);
+  const geminiBody = JSON.parse(fetch.mock.calls[1].arguments[1].body);
+  assert.match(geminiBody.contents.at(-1).parts[0].text, /В Москве 5 градусов/);
+  assert.equal(reply.response.text, "Сейчас 5 градусов.");
+
+  const [serper, gemini, alice] = info.mock.calls.map(call => JSON.parse(call.arguments[0]));
+  assert.equal(serper.event, "serper.request");
+  assert.equal(serper.timeoutMs, 1300);
+  assert.equal(gemini.event, "gemini.request");
+  assert.equal(gemini.timeoutMs, 2155);
+  assert.equal(gemini.status, 200);
+  assert.equal(alice.event, "alice.response");
+  assert.equal(alice.outcome, "answered");
+  assert.equal(alice.searchContextUsed, true);
+});

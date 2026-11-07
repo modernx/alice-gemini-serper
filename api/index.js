@@ -3,8 +3,10 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
+const RESPONSE_RESERVE_MS = 600;
+const SERPER_TIMEOUT_MS = 1300;
 const GEMINI_TIMEOUT_MS = 2500;
+const GEMINI_RESERVE_MS = 1700;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -57,24 +59,57 @@ function safeHistory(history) {
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
 }
 
-async function fetchJson(url, options, timeoutMs) {
+async function fetchJson(service, url, options, timeoutMs) {
+  const startedAt = performance.now();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let status = null;
+  let outcome;
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    const data = await response.json().catch(() => ({}));
+    status = response.status;
+    outcome = response.ok ? "success" : "http_error";
+    const data = await response.json().catch(() => {
+      if (response.ok) outcome = "body_error";
+      return {};
+    });
+    // The JSON fallback can catch an abort that occurs while reading the body.
+    controller.signal.throwIfAborted();
     return { response, data };
+  } catch (error) {
+    if (controller.signal.aborted) {
+      outcome = "timeout";
+      throw new Error("UPSTREAM_TIMEOUT", { cause: error });
+    }
+    outcome = "request_error";
+    throw new Error("UPSTREAM_REQUEST_FAILED", { cause: error });
   } finally {
     clearTimeout(timer);
+    const log = outcome === "success" ? console.info : console.warn;
+    log(JSON.stringify({
+      event: `${service}.request`,
+      outcome,
+      status,
+      durationMs: Math.round(performance.now() - startedAt),
+      timeoutMs
+    }));
   }
 }
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
+  if (!key || timeoutMs < 150) {
+    console.info(JSON.stringify({
+      event: "serper.skipped",
+      reason: key ? "insufficient_budget" : "missing_key",
+      timeoutMs
+    }));
+    return "";
+  }
 
   try {
     const { response, data } = await fetchJson(
+      "serper",
       "https://google.serper.dev/search",
       {
         method: "POST",
@@ -84,13 +119,10 @@ async function searchWeb(query, timeoutMs) {
         },
         body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
       },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+      timeoutMs
     );
 
-    if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
-    }
+    if (!response.ok) return "";
 
     const items = (Array.isArray(data.organic) ? data.organic : [])
       .slice(0, 3)
@@ -104,8 +136,7 @@ async function searchWeb(query, timeoutMs) {
     const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
     if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
-  } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
+  } catch {
     return "";
   }
 }
@@ -129,6 +160,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
   const { response, data } = await fetchJson(
+    "gemini",
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
       method: "POST",
@@ -145,12 +177,11 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    timeoutMs
   );
 
   if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    const status = response.status;
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
@@ -172,8 +203,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   return answer;
 }
 
-function errorForUser(error) {
-  switch (error?.message) {
+function errorForUser(errorCode) {
+  switch (errorCode) {
     case "MISSING_GEMINI_KEY":
       return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
     case "GEMINI_KEY_REJECTED":
@@ -183,7 +214,7 @@ function errorForUser(error) {
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
+    case "UPSTREAM_TIMEOUT":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
@@ -218,18 +249,24 @@ export default async function handler(req, res) {
     ));
   }
 
+  let searchContext = "";
+  let reply;
+  let errorCode = null;
   try {
-    let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+    if (isSearchIntent(text)) {
+      // Leave time for Gemini and for sending the final response to Alice.
+      const searchTimeoutMs = Math.max(0, Math.min(
+        SERPER_TIMEOUT_MS,
+        remainingMs() - GEMINI_RESERVE_MS - RESPONSE_RESERVE_MS
+      ));
+      searchContext = await searchWeb(text, searchTimeoutMs);
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - RESPONSE_RESERVE_MS))
     );
 
     const history = [
@@ -238,12 +275,22 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
-    return res.status(200).json(aliceResponse(answer, false, history));
+    reply = aliceResponse(answer, false, history);
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
+    errorCode = error?.message || "UNKNOWN_ERROR";
+    reply = aliceResponse(errorForUser(errorCode), false, oldHistory);
   }
+
+  // An upstream 2xx can still lead to a fallback when Gemini returns no usable text.
+  const log = errorCode ? console.warn : console.info;
+  log(JSON.stringify({
+    event: "alice.response",
+    outcome: errorCode ? "fallback" : "answered",
+    searchContextUsed: Boolean(searchContext),
+    durationMs: Date.now() - startedAt,
+    errorCode
+  }));
+  return res.status(200).json(reply);
 }
 
 export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
